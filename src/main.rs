@@ -5,7 +5,7 @@ use std::{
     env,
     error::Error,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Instant,
@@ -72,7 +72,7 @@ struct Managed {
 #[derive(Clone, Debug)]
 struct App {
     id: String,
-    text: String,
+    source: Option<PathBuf>,
     name: String,
     executable: String,
 }
@@ -162,9 +162,11 @@ fn inventory(paths: &Paths, state: &State) -> Result<Vec<App>> {
             if seen.contains(&id) {
                 continue;
             }
+            let mut source = Some(file.clone());
             let text = if i == 0 {
                 if let Some(m) = state.entries.get(&id) {
                     if let Some(original) = &m.original {
+                        source = None;
                         original.clone()
                     } else {
                         continue;
@@ -191,20 +193,20 @@ fn inventory(paths: &Paths, state: &State) -> Result<Vec<App>> {
                 id,
                 name: normalized(k.get("Name").map(String::as_str).unwrap_or("")),
                 executable: exec,
-                text,
+                source,
             });
         }
     }
     Ok(apps)
 }
-fn bookmarks(xml: &str) -> Result<Vec<Recent>> {
-    let mut reader = Reader::from_str(xml);
+fn bookmarks(input: impl BufRead, mut emit: impl FnMut(Recent)) -> Result<()> {
+    let mut reader = Reader::from_reader(input);
+    let mut buffer = Vec::with_capacity(4096);
     let mut uri = None;
-    let mut out = Vec::new();
     let mut depth = 0usize;
     let mut root_seen = false;
     loop {
-        let event = reader.read_event()?;
+        let event = reader.read_event_into(&mut buffer)?;
         let empty = matches!(event, Event::Empty(_));
         match event {
             Event::Start(e) | Event::Empty(e) => {
@@ -236,7 +238,7 @@ fn bookmarks(xml: &str) -> Result<Vec<Recent>> {
                 if local.as_ref() == b"application"
                     && let Some((uri, path)) = &uri
                 {
-                    out.push(Recent {
+                    emit(Recent {
                         uri: uri.clone(),
                         path: path.clone(),
                         name: attrs.get("name").cloned().unwrap_or_default(),
@@ -266,11 +268,50 @@ fn bookmarks(xml: &str) -> Result<Vec<Recent>> {
             Event::Eof => break,
             _ => {}
         }
+        buffer.clear();
     }
     if !root_seen || depth != 0 {
         return Err("incomplete XBEL document; leaving actions unchanged".into());
     }
-    Ok(out)
+    Ok(())
+}
+
+fn fingerprint(uri: &str) -> u64 {
+    uri.bytes().fold(0xcbf29ce484222325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    })
+}
+fn retain_latest(group: &mut Vec<Recent>, mut recent: Recent) {
+    if let Some(i) = group.iter().position(|r| r.uri == recent.uri) {
+        if group[i].modified >= recent.modified {
+            return;
+        }
+        group.remove(i);
+    }
+    let key = (std::cmp::Reverse(recent.modified), fingerprint(&recent.uri));
+    let position =
+        group.partition_point(|r| (std::cmp::Reverse(r.modified), fingerprint(&r.uri)) <= key);
+    if position >= LIMIT {
+        return;
+    }
+    if group.len() == LIMIT {
+        group.pop();
+    }
+    recent.name = String::new();
+    recent.exec = String::new();
+    group.insert(position, recent);
+}
+fn app_text<'a>(app: &App, state: &'a State) -> Result<std::borrow::Cow<'a, str>> {
+    if let Some(path) = &app.source {
+        Ok(fs::read_to_string(path)?.into())
+    } else {
+        Ok(state
+            .entries
+            .get(&app.id)
+            .and_then(|m| m.original.as_deref())
+            .ok_or("missing original desktop entry")?
+            .into())
+    }
 }
 
 // Index both identities and executables once; never scan every app per bookmark.
@@ -376,11 +417,10 @@ fn exec_arg(s: &str) -> String {
     out.push('"');
     out
 }
-fn render(app: &App, recents: &[Recent], target: &Path, gio: &Path) -> Result<String> {
-    let keys = desktop_keys(&app.text);
+fn render(text: &str, recents: &[Recent], target: &Path, gio: &Path) -> Result<String> {
+    let keys = desktop_keys(text);
     let old = keys.get("Actions").cloned().unwrap_or_default();
-    let mut used: BTreeSet<String> = app
-        .text
+    let mut used: BTreeSet<String> = text
         .lines()
         .filter_map(|l| {
             l.strip_prefix("[Desktop Action ")
@@ -413,7 +453,7 @@ fn render(app: &App, recents: &[Recent], target: &Path, gio: &Path) -> Result<St
     let mut out = String::new();
     let mut main = false;
     let mut inserted = false;
-    for line in app.text.lines() {
+    for line in text.lines() {
         if line.trim().starts_with('[') {
             if main && !inserted {
                 out.push_str(&format!("Actions={actions}\n"));
@@ -529,31 +569,27 @@ fn restore_one(paths: &Paths, id: &str, m: &Managed) -> Result<()> {
     Ok(())
 }
 fn sync(paths: &Paths, state: &mut State, dry: bool, gio: &Path) -> Result<()> {
-    let xml = match read_optional(&paths.data.join("recently-used.xbel"))? {
-        Some(xml) => xml,
-        None => "<xbel/>".into(),
-    };
-    let recents = bookmarks(&xml)?;
     let apps = inventory(paths, state)?;
     let index = Index::new(&apps);
     let mut groups: BTreeMap<usize, Vec<Recent>> = BTreeMap::new();
     let mut skipped = 0;
-    for recent in recents {
+    let mut emit = |recent: Recent| {
         if let Some(i) = index.find(&recent) {
-            groups.entry(i).or_default().push(recent);
+            retain_latest(groups.entry(i).or_default(), recent);
         } else {
             skipped += 1;
         }
+    };
+    match File::open(paths.data.join("recently-used.xbel")) {
+        Ok(file) => bookmarks(BufReader::new(file), &mut emit)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     let mut wanted = BTreeSet::new();
     let mut changed = 0;
     let mut conflicts = Vec::new();
     let mut pending = Vec::new();
-    for (i, mut group) in groups {
-        group.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.uri.cmp(&b.uri)));
-        let mut seen = BTreeSet::new();
-        group.retain(|r| seen.insert(r.uri.clone()));
-        group.truncate(LIMIT);
+    for (i, group) in groups {
         let app = &apps[i];
         wanted.insert(app.id.clone());
         let target = paths.target(&app.id);
@@ -571,7 +607,9 @@ fn sync(paths: &Paths, state: &mut State, dry: bool, gio: &Path) -> Result<()> {
             conflicts.push(app.id.clone());
             continue;
         }
-        let generated = render(app, &group, &target, gio)?;
+        let text = app_text(app, state)?;
+        let generated = render(&text, &group, &target, gio)?;
+        drop(text);
         if current.as_ref() == Some(&generated) {
             continue;
         }
@@ -602,18 +640,18 @@ fn sync(paths: &Paths, state: &mut State, dry: bool, gio: &Path) -> Result<()> {
                 Managed {
                     original,
                     original_mode,
-                    generated: generated.clone(),
+                    generated,
                     previous: current,
                 },
             );
-            pending.push((target, generated));
+            pending.push(app.id.clone());
         }
     }
     if !pending.is_empty() {
         // One journal write per batch, before any desktop-entry replacement.
         save(paths, state)?;
-        for (target, generated) in pending {
-            atomic(&target, &generated, 0o600)?;
+        for id in pending {
+            atomic(&paths.target(&id), &state.entries[&id].generated, 0o600)?;
         }
     }
     let mut removed = false;
@@ -732,7 +770,7 @@ mod tests {
     fn matching_prefers_command_and_skips_ambiguity() {
         let app = |id: &str, exe: &str| App {
             id: id.into(),
-            text: String::new(),
+            source: None,
             name: id.into(),
             executable: exe.into(),
         };
@@ -761,7 +799,7 @@ mod tests {
             id: "org.example.App.desktop".into(),
             name: "Example".into(),
             executable: "flatpak".into(),
-            text: String::new(),
+            source: None,
         }];
         let index = Index::new(&apps);
         let mut r = Recent {
@@ -776,15 +814,49 @@ mod tests {
         assert_eq!(index.find(&r), Some(0));
     }
     #[test]
+    fn bounded_selection_matches_full_sort_with_unsorted_duplicates() {
+        let mut retained = Vec::new();
+        let mut newest = BTreeMap::new();
+        for n in 0..10_000 {
+            let uri = format!("file:///item{}", (n * 7919) % 137);
+            let modified = (n * 3571) % 997;
+            newest
+                .entry(uri.clone())
+                .and_modify(|t: &mut i64| *t = (*t).max(modified))
+                .or_insert(modified);
+            retain_latest(
+                &mut retained,
+                Recent {
+                    uri,
+                    path: PathBuf::new(),
+                    name: String::new(),
+                    exec: String::new(),
+                    modified,
+                },
+            );
+            assert!(retained.len() <= LIMIT);
+        }
+        let mut expected: Vec<_> = newest.into_iter().collect();
+        expected.sort_by_key(|(uri, modified)| (std::cmp::Reverse(*modified), fingerprint(uri)));
+        expected.truncate(LIMIT);
+        assert_eq!(
+            retained
+                .into_iter()
+                .map(|r| (r.uri, r.modified))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    #[test]
     fn malformed_xml_does_not_clear_history() {
-        assert!(bookmarks("<xbel><bookmark>").is_err());
-        assert!(bookmarks("not xml").is_err());
-        assert!(bookmarks("<wrong/>").is_err());
-        assert!(bookmarks("<xbel/>").unwrap().is_empty());
+        assert!(bookmarks("<xbel><bookmark>".as_bytes(), |_| {}).is_err());
+        assert!(bookmarks("not xml".as_bytes(), |_| {}).is_err());
+        assert!(bookmarks("<wrong/>".as_bytes(), |_| {}).is_err());
+        assert!(bookmarks("<xbel/>".as_bytes(), |_| panic!("unexpected record")).is_ok());
     }
     #[test]
     fn preserves_existing_sections_and_handles_action_collisions() {
-        let app = App { id: "test.desktop".into(), name: "test".into(), executable: "test".into(), text: "[Desktop Entry]\nName=Test\nType=Application\nExec=test %U\nActions=XdgRecent0;\n\n[Desktop Action XdgRecent0]\nName=Existing\nExec=test\n".into() };
+        let text = "[Desktop Entry]\nName=Test\nType=Application\nExec=test %U\nActions=XdgRecent0;\n\n[Desktop Action XdgRecent0]\nName=Existing\nExec=test\n";
         let r = Recent {
             uri: "file:///tmp/a%20b".into(),
             path: "/tmp/a b".into(),
@@ -793,7 +865,7 @@ mod tests {
             modified: i64::MIN,
         };
         let out = render(
-            &app,
+            text,
             &[r],
             Path::new("/tmp/test.desktop"),
             Path::new("/usr/bin/gio"),
