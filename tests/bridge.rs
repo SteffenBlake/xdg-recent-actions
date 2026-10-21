@@ -72,7 +72,7 @@ fn dry_run_cap_noop_stale_and_restore() {
     assert!(!text.contains("Recent: file 0 "));
     assert!(text.contains("Actions=New;XdgRecent0;"));
     let before = fs::metadata(f.generated()).unwrap().modified().unwrap();
-    let state_before = fs::metadata(f.path("state/xdg-recent-actions/state.json"))
+    let state_before = fs::metadata(f.path("state/xdg-recent-actions/entries/code.desktop.json"))
         .unwrap()
         .modified()
         .unwrap();
@@ -83,7 +83,7 @@ fn dry_run_cap_noop_stale_and_restore() {
     );
     assert_eq!(
         state_before,
-        fs::metadata(f.path("state/xdg-recent-actions/state.json"))
+        fs::metadata(f.path("state/xdg-recent-actions/entries/code.desktop.json"))
             .unwrap()
             .modified()
             .unwrap()
@@ -112,16 +112,10 @@ fn user_override_is_restored_byte_for_byte_and_manual_edits_refused() {
         "user changed this"
     );
     let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(f.path("state/xdg-recent-actions/state.json")).unwrap(),
+        &fs::read_to_string(f.path("state/xdg-recent-actions/entries/code.desktop.json")).unwrap(),
     )
     .unwrap();
-    fs::write(
-        f.generated(),
-        state["entries"]["code.desktop"]["generated"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
+    fs::write(f.generated(), state["generated"].as_str().unwrap()).unwrap();
     f.ok(&["restore"]);
     assert_eq!(fs::read_to_string(f.generated()).unwrap(), original);
     assert_eq!(
@@ -178,16 +172,10 @@ fn journal_recovers_interrupted_first_write_and_replacement() {
     f.history(2);
     f.ok(&["sync"]);
     let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(f.path("state/xdg-recent-actions/state.json")).unwrap(),
+        &fs::read_to_string(f.path("state/xdg-recent-actions/entries/code.desktop.json")).unwrap(),
     )
     .unwrap();
-    fs::write(
-        f.generated(),
-        state["entries"]["code.desktop"]["previous"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
+    fs::write(f.generated(), state["previous"].as_str().unwrap()).unwrap();
     f.ok(&["sync"]);
     assert_eq!(
         fs::read_to_string(f.generated())
@@ -255,4 +243,34 @@ fn generated_exec_round_trips_special_characters_without_shell_execution() {
         args.trim() == uri || Path::new(args.trim()) == file,
         "unexpected argv: {args:?}"
     );
+}
+
+#[test]
+fn legacy_state_migrates_and_can_be_exported_for_installer_rollback() {
+    let f = Fixture::new();
+    f.history(1);
+    f.ok(&["sync"]);
+    let entry = f.path("state/xdg-recent-actions/entries/code.desktop.json");
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&entry).unwrap()).unwrap();
+    let legacy = serde_json::json!({"version":1,"entries":{"code.desktop":record}});
+    let manifest = f.path("state/xdg-recent-actions/state.json");
+    fs::write(&manifest, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    fs::remove_file(&entry).unwrap();
+    let desktop_before = fs::read(f.generated()).unwrap();
+    f.ok(&["check"]);
+    assert!(!entry.exists()); // Preflight stays read-only even for older state formats.
+    f.ok(&["sync"]);
+    let v2: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(v2["version"], 2);
+    assert_eq!(v2["entries"]["code.desktop"], false);
+    assert_eq!(desktop_before, fs::read(f.generated()).unwrap());
+    f.ok(&["export-state-v1"]);
+    let exported: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(exported, legacy);
+    f.ok(&["sync"]);
+    f.ok(&["restore"]);
+    assert!(!f.generated().exists());
 }

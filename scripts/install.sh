@@ -92,6 +92,13 @@ done
 rollback() {
     printf 'Activation failed; restoring the previous binary and units.\n' >&2
     systemctl --user stop "$name.path" "$name.service" >/dev/null 2>&1 || :
+    # Keep recovery state readable by an older binary after a format migration.
+    if [ -f "$stage/$name.old" ] && [ -x "$bindir/$name" ]; then
+        if ! XDG_DATA_HOME="$data" XDG_STATE_HOME="$state" "$bindir/$name" export-state-v1; then
+            printf 'Could not export recovery state; keeping the candidate binary for recovery.\n' >&2
+            cp -p "$bindir/$name" "$stage/$name.old"
+        fi
+    fi
     for file in "$bindir/$name" "$units/$name.service" "$units/$name.path"; do
         old=$stage/$(basename "$file").old
         if [ -f "$old" ]; then cp -p "$old" "$file"; else rm -f "$file"; fi

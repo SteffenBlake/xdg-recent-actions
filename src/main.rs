@@ -6,7 +6,7 @@ use std::{
     error::Error,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{FileExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -57,7 +57,9 @@ impl Paths {
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     version: u32,
-    entries: BTreeMap<String, Managed>,
+    entries: BTreeMap<String, bool>,
+    #[serde(skip)]
+    legacy: BTreeMap<String, Managed>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Managed {
@@ -80,9 +82,6 @@ struct App {
 struct Recent {
     uri: String,
     path: PathBuf,
-    name: String,
-    exec: String,
-    modified: i64,
 }
 
 fn desktop_keys(text: &str) -> BTreeMap<String, String> {
@@ -164,13 +163,15 @@ fn inventory(paths: &Paths, state: &State) -> Result<Vec<App>> {
             }
             let mut source = Some(file.clone());
             let text = if i == 0 {
-                if let Some(m) = state.entries.get(&id) {
-                    if let Some(original) = &m.original {
-                        source = None;
-                        original.clone()
-                    } else {
+                if let Some(has_original) = state.entries.get(&id) {
+                    if !has_original {
                         continue;
                     }
+                    source = None;
+                    managed(paths, state, &id)?
+                        .ok_or("missing ownership record")?
+                        .original
+                        .ok_or("missing original desktop entry")?
                 } else {
                     fs::read_to_string(&file)?
                 }
@@ -199,14 +200,26 @@ fn inventory(paths: &Paths, state: &State) -> Result<Vec<App>> {
     }
     Ok(apps)
 }
-fn bookmarks(input: impl BufRead, mut emit: impl FnMut(Recent)) -> Result<()> {
+#[derive(Clone, Copy, Debug)]
+struct Pin {
+    offset: u64,
+    length: u64,
+    modified: i64,
+    identity: u64,
+}
+fn bookmarks(
+    input: impl BufRead,
+    mut emit: impl FnMut(&str, &str, &str, Pin) -> Result<()>,
+) -> Result<()> {
     let mut reader = Reader::from_reader(input);
     let mut buffer = Vec::with_capacity(4096);
     let mut uri = None;
     let mut depth = 0usize;
     let mut root_seen = false;
     loop {
+        let offset = reader.buffer_position();
         let event = reader.read_event_into(&mut buffer)?;
+        let length = reader.buffer_position() - offset;
         let empty = matches!(event, Event::Empty(_));
         match event {
             Event::Start(e) | Event::Empty(e) => {
@@ -217,38 +230,42 @@ fn bookmarks(input: impl BufRead, mut emit: impl FnMut(Recent)) -> Result<()> {
                     }
                     root_seen = true;
                 }
-                let attrs = e
-                    .attributes()
-                    .map(|a| {
-                        let a = a?;
-                        Ok((
-                            String::from_utf8(a.key.local_name().as_ref().to_vec())?,
-                            a.decode_and_unescape_value(reader.decoder())?.into_owned(),
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
+                let mut href = std::borrow::Cow::Borrowed("");
+                let mut name = std::borrow::Cow::Borrowed("");
+                let mut exec = std::borrow::Cow::Borrowed("");
+                let mut modified = std::borrow::Cow::Borrowed("");
+                for attr in e.attributes() {
+                    let attr = attr?;
+                    let value = attr.decode_and_unescape_value(reader.decoder())?;
+                    match attr.key.local_name().as_ref() {
+                        b"href" => href = value,
+                        b"name" => name = value,
+                        b"exec" => exec = value,
+                        b"modified" => modified = value,
+                        _ => {}
+                    }
+                }
                 if local.as_ref() == b"bookmark" {
-                    uri = attrs
-                        .get("href")
-                        .and_then(|href| Url::parse(href).ok())
+                    uri = Url::parse(&href)
+                        .ok()
                         .filter(|url| url.scheme() == "file")
-                        .and_then(|url| url.to_file_path().ok().map(|path| (url.to_string(), path)))
-                        .filter(|(_, path)| path.exists());
+                        .filter(|url| url.to_file_path().is_ok_and(|path| path.exists()))
+                        .map(|url| (url.to_string(), offset, length));
                 }
                 if local.as_ref() == b"application"
-                    && let Some((uri, path)) = &uri
+                    && let Some((uri, offset, length)) = &uri
                 {
-                    emit(Recent {
-                        uri: uri.clone(),
-                        path: path.clone(),
-                        name: attrs.get("name").cloned().unwrap_or_default(),
-                        exec: attrs.get("exec").cloned().unwrap_or_default(),
-                        modified: attrs
-                            .get("modified")
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                            .map(|t| t.timestamp_micros())
-                            .unwrap_or(i64::MIN),
-                    });
+                    let modified = chrono::DateTime::parse_from_rfc3339(&modified)
+                        .ok()
+                        .map(|t| t.timestamp_micros())
+                        .unwrap_or(i64::MIN);
+                    let pin = Pin {
+                        offset: *offset,
+                        length: *length,
+                        modified,
+                        identity: fingerprint(uri),
+                    };
+                    emit(uri, &name, &exec, pin)?;
                 }
                 if !empty {
                     depth += 1;
@@ -281,33 +298,61 @@ fn fingerprint(uri: &str) -> u64 {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     })
 }
-fn retain_latest(group: &mut Vec<Recent>, mut recent: Recent) {
-    if let Some(i) = group.iter().position(|r| r.uri == recent.uri) {
-        if group[i].modified >= recent.modified {
-            return;
+fn read_pin(file: &File, pin: Pin) -> Result<Recent> {
+    let mut bytes = vec![0; usize::try_from(pin.length)?];
+    file.read_exact_at(&mut bytes, pin.offset)?;
+    let mut reader = Reader::from_reader(bytes.as_slice());
+    let event = reader.read_event()?;
+    let element = match event {
+        Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"bookmark" => e,
+        _ => return Err("history changed during scan".into()),
+    };
+    let mut uri = None;
+    for attr in element.attributes() {
+        let attr = attr?;
+        if attr.key.local_name().as_ref() == b"href" {
+            uri = Some(Url::parse(
+                &attr.decode_and_unescape_value(reader.decoder())?,
+            )?);
         }
-        group.remove(i);
     }
-    let key = (std::cmp::Reverse(recent.modified), fingerprint(&recent.uri));
-    let position =
-        group.partition_point(|r| (std::cmp::Reverse(r.modified), fingerprint(&r.uri)) <= key);
+    let url = uri.ok_or("bookmark has no href")?;
+    let path = url
+        .to_file_path()
+        .map_err(|_| "bookmark is no longer a local file")?;
+    let uri = url.to_string();
+    if fingerprint(&uri) != pin.identity {
+        return Err("history changed during scan".into());
+    }
+    Ok(Recent { uri, path })
+}
+fn retain_pin(file: &File, group: &mut Vec<Pin>, uri: &str, pin: Pin) -> Result<()> {
+    // Hashes limit positional reads; compare actual URIs before treating a hash match as a duplicate.
+    for i in 0..group.len() {
+        if group[i].identity == pin.identity && read_pin(file, group[i])?.uri == uri {
+            if group[i].modified >= pin.modified {
+                return Ok(());
+            }
+            group.remove(i);
+            break;
+        }
+    }
+    let key = (std::cmp::Reverse(pin.modified), pin.identity);
+    let position = group.partition_point(|p| (std::cmp::Reverse(p.modified), p.identity) <= key);
     if position >= LIMIT {
-        return;
+        return Ok(());
     }
     if group.len() == LIMIT {
         group.pop();
     }
-    recent.name = String::new();
-    recent.exec = String::new();
-    group.insert(position, recent);
+    group.insert(position, pin);
+    Ok(())
 }
-fn app_text<'a>(app: &App, state: &'a State) -> Result<std::borrow::Cow<'a, str>> {
+fn app_text<'a>(app: &App, record: Option<&'a Managed>) -> Result<std::borrow::Cow<'a, str>> {
     if let Some(path) = &app.source {
         Ok(fs::read_to_string(path)?.into())
     } else {
-        Ok(state
-            .entries
-            .get(&app.id)
+        Ok(record
             .and_then(|m| m.original.as_deref())
             .ok_or("missing original desktop entry")?
             .into())
@@ -337,10 +382,10 @@ impl Index {
         }
         index
     }
-    fn find(&self, recent: &Recent) -> Option<usize> {
-        let name = normalized(&recent.name);
+    fn find(&self, recorded_name: &str, recorded_exec: &str) -> Option<usize> {
+        let name = normalized(recorded_name);
         let names = self.names.get(&name);
-        let command = executable(&recent.exec, true);
+        let command = executable(recorded_exec, true);
         let execs = command.as_ref().and_then(|e| self.executables.get(e));
         // The actual launch command takes precedence over a reporting app's name.
         if let Some(execs) = execs {
@@ -527,23 +572,109 @@ fn save(paths: &Paths, state: &State) -> Result<()> {
         0o600,
     )
 }
-fn load(paths: &Paths) -> Result<State> {
-    let state: State = match read_optional(&paths.state.join("state.json"))? {
-        Some(s) => serde_json::from_str(&s)?,
-        None => State {
-            version: 1,
-            ..State::default()
-        },
-    };
-    if state.version != 1 {
-        return Err("unsupported state version; upgrade without deleting state.json".into());
+fn record_path(paths: &Paths, id: &str) -> PathBuf {
+    paths.state.join("entries").join(format!("{id}.json"))
+}
+fn managed(paths: &Paths, state: &State, id: &str) -> Result<Option<Managed>> {
+    if let Some(m) = state.legacy.get(id) {
+        return Ok(Some(m.clone()));
     }
+    if !state.entries.contains_key(id) {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_reader(BufReader::new(File::open(
+        record_path(paths, id),
+    )?))?))
+}
+fn load(paths: &Paths, dry: bool) -> Result<State> {
+    let value: serde_json::Value = match File::open(paths.state.join("state.json")) {
+        Ok(file) => serde_json::from_reader(BufReader::new(file))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(State {
+                version: 2,
+                ..State::default()
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut state: State = match value["version"].as_u64() {
+        Some(2) => serde_json::from_value(value)?,
+        Some(1) => {
+            #[derive(Deserialize)]
+            struct Legacy {
+                entries: BTreeMap<String, Managed>,
+            }
+            let old: Legacy = serde_json::from_value(value)?;
+            State {
+                version: 2,
+                entries: old
+                    .entries
+                    .iter()
+                    .map(|(id, m)| (id.clone(), m.original.is_some()))
+                    .collect(),
+                legacy: old.entries,
+            }
+        }
+        _ => return Err("unsupported state version; upgrade without deleting state.json".into()),
+    };
     for id in state.entries.keys() {
         if id.contains('/') || !id.ends_with(".desktop") {
             return Err("invalid desktop ID in state".into());
         }
     }
+    if !dry && !state.legacy.is_empty() {
+        for (id, record) in &state.legacy {
+            atomic(
+                &record_path(paths, id),
+                &serde_json::to_string(record)?,
+                0o600,
+            )?;
+        }
+        save(paths, &state)?;
+        state.legacy.clear();
+    }
     Ok(state)
+}
+fn forget(paths: &Paths, state: &mut State, id: &str) -> Result<()> {
+    state.entries.remove(id);
+    save(paths, state)?;
+    match fs::remove_file(record_path(paths, id)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+// Used by the installer before rolling back to a binary that only understands v1.
+fn export_v1(paths: &Paths, state: &State) -> Result<()> {
+    let tmp = paths
+        .state
+        .join(format!(".export-{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(b"{\"version\":1,\"entries\":{")?;
+        for (i, id) in state.entries.keys().enumerate() {
+            if i > 0 {
+                file.write_all(b",")?;
+            }
+            serde_json::to_writer(&mut file, id)?;
+            file.write_all(b":")?;
+            serde_json::to_writer(
+                &mut file,
+                &managed(paths, state, id)?.ok_or("missing ownership record")?,
+            )?;
+        }
+        file.write_all(b"}}")?;
+        file.sync_all()?;
+        fs::rename(&tmp, paths.state.join("state.json"))?;
+        File::open(&paths.state)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 fn owned(current: &Option<String>, m: &Managed) -> bool {
     current.as_ref() == Some(&m.generated) || current == &m.previous
@@ -571,25 +702,41 @@ fn restore_one(paths: &Paths, id: &str, m: &Managed) -> Result<()> {
 fn sync(paths: &Paths, state: &mut State, dry: bool, gio: &Path) -> Result<()> {
     let apps = inventory(paths, state)?;
     let index = Index::new(&apps);
-    let mut groups: BTreeMap<usize, Vec<Recent>> = BTreeMap::new();
+    let mut groups: BTreeMap<usize, Vec<Pin>> = BTreeMap::new();
     let mut skipped = 0;
-    let mut emit = |recent: Recent| {
-        if let Some(i) = index.find(&recent) {
-            retain_latest(groups.entry(i).or_default(), recent);
-        } else {
-            skipped += 1;
-        }
-    };
-    match File::open(paths.data.join("recently-used.xbel")) {
-        Ok(file) => bookmarks(BufReader::new(file), &mut emit)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    let file = match File::open(paths.data.join("recently-used.xbel")) {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
+    };
+    if let Some(file) = &file {
+        let before = file.metadata()?;
+        bookmarks(BufReader::new(file), |uri, name, exec, pin| {
+            if let Some(i) = index.find(name, exec) {
+                retain_pin(file, groups.entry(i).or_default(), uri, pin)?;
+            } else {
+                skipped += 1;
+            }
+            Ok(())
+        })?;
+        let after = file.metadata()?;
+        if before.len() != after.len() || before.modified()? != after.modified()? {
+            return Err("history changed during scan; leaving actions unchanged".into());
+        }
     }
     let mut wanted = BTreeSet::new();
     let mut changed = 0;
     let mut conflicts = Vec::new();
-    let mut pending = Vec::new();
-    for (i, group) in groups {
+    for (i, pins) in groups {
+        let group = pins
+            .into_iter()
+            .map(|pin| {
+                read_pin(
+                    file.as_ref().expect("pins require an open history file"),
+                    pin,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let app = &apps[i];
         wanted.insert(app.id.clone());
         let target = paths.target(&app.id);
@@ -598,7 +745,8 @@ fn sync(paths: &Paths, state: &mut State, dry: bool, gio: &Path) -> Result<()> {
             continue;
         }
         let current = read_optional(&target)?;
-        if let Some(m) = state.entries.get(&app.id) {
+        let record = managed(paths, state, &app.id)?;
+        if let Some(m) = &record {
             if !owned(&current, m) {
                 conflicts.push(app.id.clone());
                 continue;
@@ -607,7 +755,7 @@ fn sync(paths: &Paths, state: &mut State, dry: bool, gio: &Path) -> Result<()> {
             conflicts.push(app.id.clone());
             continue;
         }
-        let text = app_text(app, state)?;
+        let text = app_text(app, record.as_ref())?;
         let generated = render(&text, &group, &target, gio)?;
         drop(text);
         if current.as_ref() == Some(&generated) {
@@ -621,62 +769,56 @@ fn sync(paths: &Paths, state: &mut State, dry: bool, gio: &Path) -> Result<()> {
             group.len()
         );
         if !dry {
-            let original = state
-                .entries
-                .get(&app.id)
+            let original = record
+                .as_ref()
                 .map(|m| m.original.clone())
                 .unwrap_or_else(|| current.clone());
-            let original_mode = state
+            let original_mode = record.as_ref().and_then(|m| m.original_mode).or_else(|| {
+                fs::metadata(&target)
+                    .ok()
+                    .map(|m| m.permissions().mode() & 0o777)
+            });
+            let record = Managed {
+                original,
+                original_mode,
+                generated,
+                previous: current,
+            };
+            // Journal one app, update the small ownership index if needed, then publish it.
+            atomic(
+                &record_path(paths, &app.id),
+                &serde_json::to_string(&record)?,
+                0o600,
+            )?;
+            if state
                 .entries
-                .get(&app.id)
-                .and_then(|m| m.original_mode)
-                .or_else(|| {
-                    fs::metadata(&target)
-                        .ok()
-                        .map(|m| m.permissions().mode() & 0o777)
-                });
-            state.entries.insert(
-                app.id.clone(),
-                Managed {
-                    original,
-                    original_mode,
-                    generated,
-                    previous: current,
-                },
-            );
-            pending.push(app.id.clone());
+                .insert(app.id.clone(), record.original.is_some())
+                .is_none()
+            {
+                save(paths, state)?;
+            }
+            atomic(&target, &record.generated, 0o600)?;
         }
     }
-    if !pending.is_empty() {
-        // One journal write per batch, before any desktop-entry replacement.
-        save(paths, state)?;
-        for id in pending {
-            atomic(&paths.target(&id), &state.entries[&id].generated, 0o600)?;
-        }
-    }
-    let mut removed = false;
     for id in state.entries.keys().cloned().collect::<Vec<_>>() {
         if wanted.contains(&id) {
             continue;
         }
         println!("{} {id}", if dry { "Would restore" } else { "Restoring" });
+        let record = managed(paths, state, &id)?.ok_or("missing ownership record")?;
         if dry {
             let current = read_optional(&paths.target(&id))?;
-            if current != state.entries[&id].original && !owned(&current, &state.entries[&id]) {
+            if current != record.original && !owned(&current, &record) {
                 conflicts.push(id);
             }
         } else {
-            if let Err(e) = restore_one(paths, &id, &state.entries[&id]) {
+            if let Err(e) = restore_one(paths, &id, &record) {
                 eprintln!("{e}");
                 conflicts.push(id);
                 continue;
             }
-            state.entries.remove(&id);
-            removed = true;
+            forget(paths, state, &id)?;
         }
-    }
-    if removed {
-        save(paths, state)?;
     }
     println!(
         "{} apps indexed; {changed} updates; {skipped} unmatched/ambiguous records skipped",
@@ -715,7 +857,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let command = args[0].as_str();
-    if !matches!(command, "sync" | "restore" | "check")
+    if !matches!(command, "sync" | "restore" | "check" | "export-state-v1")
         || args.len() > 2
         || (args.len() == 2 && (command != "sync" || args[1] != "--dry-run"))
     {
@@ -738,13 +880,15 @@ fn run() -> Result<()> {
     } else {
         None
     };
-    let mut state = load(&paths)?;
+    let mut state = load(&paths, dry)?;
     let start = Instant::now();
-    if command == "restore" {
+    if command == "export-state-v1" {
+        export_v1(&paths, &state)?;
+    } else if command == "restore" {
         for id in state.entries.keys().cloned().collect::<Vec<_>>() {
-            restore_one(&paths, &id, &state.entries[&id])?;
-            state.entries.remove(&id);
-            save(&paths, &state)?;
+            let record = managed(&paths, &state, &id)?.ok_or("missing ownership record")?;
+            restore_one(&paths, &id, &record)?;
+            forget(&paths, &mut state, &id)?;
             println!("Restored {id}");
         }
     } else {
@@ -780,18 +924,9 @@ mod tests {
             app("other.desktop", "inkscape"),
         ];
         let index = Index::new(&apps);
-        let mut r = Recent {
-            uri: String::new(),
-            path: PathBuf::new(),
-            name: "nemo".into(),
-            exec: "'inkscape %F'".into(),
-            modified: i64::MIN,
-        };
-        assert_eq!(index.find(&r), None);
-        r.name = "inkscape".into();
-        assert_eq!(index.find(&r), Some(1));
-        r.exec = "'nemo %U'".into();
-        assert_eq!(index.find(&r), Some(0));
+        assert_eq!(index.find("nemo", "'inkscape %F'"), None);
+        assert_eq!(index.find("inkscape", "'inkscape %F'"), Some(1));
+        assert_eq!(index.find("inkscape", "'nemo %U'"), Some(0));
     }
     #[test]
     fn generic_wrappers_require_an_application_identity() {
@@ -802,57 +937,71 @@ mod tests {
             source: None,
         }];
         let index = Index::new(&apps);
-        let mut r = Recent {
-            uri: String::new(),
-            path: PathBuf::new(),
-            name: "unknown".into(),
-            exec: "flatpak run org.other.App %u".into(),
-            modified: i64::MIN,
-        };
-        assert_eq!(index.find(&r), None);
-        r.name = "org.example.App".into();
-        assert_eq!(index.find(&r), Some(0));
+        assert_eq!(index.find("unknown", "flatpak run org.other.App %u"), None);
+        assert_eq!(
+            index.find("org.example.App", "flatpak run org.example.App %u"),
+            Some(0)
+        );
     }
     #[test]
-    fn bounded_selection_matches_full_sort_with_unsorted_duplicates() {
-        let mut retained = Vec::new();
+    fn bounded_pins_match_full_sort_with_unsorted_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let item = dir.path().join("a & b");
+        fs::write(&item, "").unwrap();
+        let mut xml = String::from("<xbel>");
         let mut newest = BTreeMap::new();
         for n in 0..10_000 {
-            let uri = format!("file:///item{}", (n * 7919) % 137);
+            let mut url = Url::from_file_path(&item).unwrap();
+            url.set_fragment(Some(&format!("item{}", (n * 7919) % 137)));
+            let uri = url.to_string();
             let modified = (n * 3571) % 997;
             newest
                 .entry(uri.clone())
                 .and_modify(|t: &mut i64| *t = (*t).max(modified))
                 .or_insert(modified);
-            retain_latest(
-                &mut retained,
-                Recent {
-                    uri,
-                    path: PathBuf::new(),
-                    name: String::new(),
-                    exec: String::new(),
-                    modified,
-                },
-            );
-            assert!(retained.len() <= LIMIT);
+            let stamp = chrono::DateTime::from_timestamp(modified, 0)
+                .unwrap()
+                .to_rfc3339();
+            xml.push_str(&format!(
+                "<bookmark href=\"{}\"><application modified=\"{stamp}\"/></bookmark>",
+                quick_xml::escape::escape(&uri)
+            ));
         }
+        xml.push_str("</xbel>");
+        let history = dir.path().join("history");
+        fs::write(&history, &xml).unwrap();
+        let file = File::open(history).unwrap();
+        let mut retained = Vec::new();
+        bookmarks(BufReader::new(&file), |uri, _, _, pin| {
+            retain_pin(&file, &mut retained, uri, pin)?;
+            assert!(retained.len() <= LIMIT);
+            Ok(())
+        })
+        .unwrap();
         let mut expected: Vec<_> = newest.into_iter().collect();
         expected.sort_by_key(|(uri, modified)| (std::cmp::Reverse(*modified), fingerprint(uri)));
         expected.truncate(LIMIT);
-        assert_eq!(
-            retained
-                .into_iter()
-                .map(|r| (r.uri, r.modified))
-                .collect::<Vec<_>>(),
-            expected
-        );
+        let result = retained
+            .into_iter()
+            .map(|pin| {
+                let r = read_pin(&file, pin).unwrap();
+                (r.uri, pin.modified / 1_000_000)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(result, expected);
+        assert_eq!(std::mem::size_of::<Pin>(), 32);
     }
     #[test]
     fn malformed_xml_does_not_clear_history() {
-        assert!(bookmarks("<xbel><bookmark>".as_bytes(), |_| {}).is_err());
-        assert!(bookmarks("not xml".as_bytes(), |_| {}).is_err());
-        assert!(bookmarks("<wrong/>".as_bytes(), |_| {}).is_err());
-        assert!(bookmarks("<xbel/>".as_bytes(), |_| panic!("unexpected record")).is_ok());
+        assert!(bookmarks("<xbel><bookmark>".as_bytes(), |_, _, _, _| Ok(())).is_err());
+        assert!(bookmarks("not xml".as_bytes(), |_, _, _, _| Ok(())).is_err());
+        assert!(bookmarks("<wrong/>".as_bytes(), |_, _, _, _| Ok(())).is_err());
+        assert!(
+            bookmarks("<xbel/>".as_bytes(), |_, _, _, _| panic!(
+                "unexpected record"
+            ))
+            .is_ok()
+        );
     }
     #[test]
     fn preserves_existing_sections_and_handles_action_collisions() {
@@ -860,9 +1009,6 @@ mod tests {
         let r = Recent {
             uri: "file:///tmp/a%20b".into(),
             path: "/tmp/a b".into(),
-            name: String::new(),
-            exec: String::new(),
-            modified: i64::MIN,
         };
         let out = render(
             text,

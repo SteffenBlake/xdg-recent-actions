@@ -38,7 +38,10 @@ Existing desktop-entry backups are retained.
 A systemd path unit watches `$XDG_DATA_HOME/recently-used.xbel` using inotify.
 After a write closes or the file is replaced, it starts one Rust process. There
 is no polling or resident helper. Each run indexes installed applications once
-and rewrites only desktop entries whose content changed.
+and scans the XML through a buffered reader. It retains at most eight 32-byte
+bookmark pins per matched application, then rereads those bookmark headers.
+Desktop-entry text and recovery records are loaded one application at a time.
+Unchanged output is detected with an exact byte comparison and is not rewritten.
 
 The program adds up to eight recent items per application, newest first. It
 matches recorded launch executables against installed entries, using application
@@ -58,10 +61,12 @@ Default locations (the usual XDG environment overrides are respected):
 - Binary: `~/.local/bin/xdg-recent-actions`
 - Units: `~/.config/systemd/user/xdg-recent-actions.{path,service}`
 - Overrides: `~/.local/share/applications/`
-- Backups and ownership state: `~/.local/state/xdg-recent-actions/state.json`
+- Ownership index: `~/.local/state/xdg-recent-actions/state.json`
+- Per-app backups: `~/.local/state/xdg-recent-actions/entries/`
 
-Do not delete the state file while overrides are installed. It contains the
-original user entries needed for restoration.
+Keep the state directory while overrides are installed. Its per-app records
+contain the original user entries needed for restoration. Older state is
+migrated automatically during installation; preflight checks leave it untouched.
 
 Applications must record history in XBEL for it to appear here. This program
 does not read private application history databases. A launcher's own cache may
@@ -100,4 +105,14 @@ make check
 
 `make check` requires rustfmt and Clippy. An additional GIO activation test uses
 `desktop-file-validate` and `python3-gi`; run it with
-`cargo test --locked -- --include-ignored`. Python is only used by that test.
+`cargo test --locked -- --include-ignored`. The optional benchmark harness also uses Python 3 and GNU time.
+
+To compare release builds without touching installed entries:
+
+```sh
+python3 tools/benchmark.py --variant before=/path/to/old-binary --variant after=target/release/xdg-recent-actions --output results.json
+```
+
+It snapshots the current history into temporary directories and also measures
+synthetic histories and large desktop entries. Results include elapsed time and
+peak resident memory. All generated files are removed afterward.
