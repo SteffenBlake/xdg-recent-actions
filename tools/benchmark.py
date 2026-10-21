@@ -11,7 +11,6 @@ import statistics
 import subprocess
 import tempfile
 import time
-import xml.etree.ElementTree as ET
 
 
 def main():
@@ -35,18 +34,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="xdg-recent-bench-") as temporary:
         root = Path(temporary)
         data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
-        state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
         originals = root / "originals"
         originals.mkdir()
-        manifest_path = state / "xdg-recent-actions/state.json"
-        manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"entries": {}}
+        generated = data / "xdg-recent-actions/generated"
         for file in (data / "applications").glob("*.desktop"):
-            if file.name in manifest["entries"]:
-                record = manifest["entries"][file.name]
-                if manifest["version"] == 2:
-                    record = json.loads((manifest_path.parent / "entries" / (file.name + ".json")).read_text())
-                if record["original"] is not None:
-                    (originals / file.name).write_text(record["original"])
+            if file.is_symlink() and file.resolve().parent == generated.resolve():
+                original = data / "xdg-recent-actions/originals" / file.name
+                if original.exists(): shutil.copyfile(original, originals / file.name)
             else:
                 shutil.copyfile(file, originals / file.name)
 
@@ -103,7 +97,7 @@ def main():
             # Alternate order between rounds to reduce order and scheduling bias.
             for run in range(args.runs):
                 for name in (list(variants) if run % 2 == 0 else list(reversed(variants))):
-                    samples[name].append(measure(args.time, variants[name], environments[name], root / "metrics"))
+                    samples[name].append(measure(args.time, variants[name], environments[name], root / "metrics", unchanged=True))
             for name, rows in samples.items():
                 result = {"case": label, "variant": name, "runs": args.runs,
                           "median_wall_ms": statistics.median(r["wall_ms"] for r in rows),
@@ -116,12 +110,14 @@ def main():
             args.output.write_text(json.dumps(report, indent=2) + "\n")
 
 
-def measure(timer, binary, environment, metrics):
+def measure(timer, binary, environment, metrics, unchanged=False):
     start = time.perf_counter_ns()
     run = subprocess.run([timer, "-o", str(metrics), "-f", "%M", binary, "sync"], env=environment, text=True, capture_output=True)
     elapsed = (time.perf_counter_ns() - start) / 1e6
     if run.returncode:
         raise RuntimeError(run.stdout + run.stderr)
+    if unchanged and any(line.startswith(("Updating ", "Restoring ")) for line in run.stdout.splitlines()):
+        raise RuntimeError("steady-state benchmark unexpectedly wrote a desktop entry")
     processing = re.search(r"Finished in ([0-9.]+) ms", run.stdout)
     return {"wall_ms": elapsed, "processing_ms": float(processing[1]), "rss_kib": int(metrics.read_text())}
 

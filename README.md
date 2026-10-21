@@ -1,9 +1,8 @@
 # xdg-recent-actions
 
 Adds recent files and folders to application menus using freedesktop Desktop
-Actions. Reads `recently-used.xbel` and writes user-local `.desktop` overrides.
-Works with launchers that display Desktop Actions, independent of the desktop
-environment or display server.
+Actions. Reads `recently-used.xbel` and generates `.desktop` files for launchers
+that display those actions.
 
 ## Install
 
@@ -17,84 +16,78 @@ cd xdg-recent-actions
 make install
 ```
 
-The installer checks prerequisites, builds and tests the program, checks the
-history and existing overrides, then installs the binary and user units. It
-runs an initial sync and enables the watcher for future logins. The build and
-checks finish before the running installation is stopped. If activation fails,
-the previous binary and units are restored.
+The installer checks prerequisites, builds and tests the program, validates the
+units, runs an initial sync, and enables monitoring for future logins. Build and
+preflight failures leave the running installation alone. Activation failures
+restore the previous binary and units.
 
-To update an installation:
+To update:
 
 ```sh
 git pull --ff-only
 make install
 ```
 
-Reinstalling prints the old and new versions and replaces the binary and units.
-Existing desktop-entry backups are retained.
+Reinstalling prints the old and new versions before replacing the binary and
+units. If an older installation uses a different layout, its installed binary
+restores the entries before the new layout is applied.
 
-## What it changes
+## Files and ownership
 
-A systemd path unit watches `$XDG_DATA_HOME/recently-used.xbel` using inotify.
-After a write closes or the file is replaced, it starts one Rust process. There
-is no polling or resident helper. Each run indexes installed applications once
-and scans the XML through a buffered reader. It retains at most eight 32-byte
-bookmark pins per matched application, then rereads those bookmark headers.
-Desktop-entry text and recovery records are loaded one application at a time.
-Unchanged output is detected with an exact byte comparison and is not rewritten.
+Default layout, under `~/.local/share/`:
 
-The program adds up to eight recent items per application, newest first. It
-matches recorded launch executables against installed entries, using application
-names and desktop IDs to resolve duplicates. Ambiguous and unmatched records
-are skipped. Only existing local files and directories are included. XBEL launch
-commands are used for matching; actions launch through the installed desktop
-entry using `gio launch`.
+```text
+applications/example.desktop -> ../xdg-recent-actions/generated/example.desktop
+xdg-recent-actions/generated/example.desktop
+xdg-recent-actions/originals/example.desktop
+```
 
-System-installed entries stay untouched. Overrides keep existing actions and
-incorporate vendor-entry updates on the next sync. Existing user overrides are
-backed up first. A manually edited generated file causes an error and is left
-untouched. To customize an entry, uninstall first, edit the original, then
-reinstall. Recovery state is journaled before each desktop-entry replacement.
+The symlink identifies an entry owned by this program. The original file exists
+only if a user entry was already present. It is backed up once and restored on
+uninstall. System-installed entries stay untouched.
 
-Default locations (the usual XDG environment overrides are respected):
+Each update uses the saved original or the installed vendor entry as its source.
+Generated output is never backed up as an original. If someone replaces the
+symlink with a different file, that replacement is left alone and any original
+backup is retained. Generated files are automatic output; to customize an entry,
+uninstall, edit the original, then reinstall.
 
-- Binary: `~/.local/bin/xdg-recent-actions`
-- Units: `~/.config/systemd/user/xdg-recent-actions.{path,service}`
-- Overrides: `~/.local/share/applications/`
-- Ownership index: `~/.local/state/xdg-recent-actions/state.json`
-- Per-app backups: `~/.local/state/xdg-recent-actions/entries/`
+The program respects `XDG_DATA_HOME` and `XDG_DATA_DIRS`. It installs its binary at
+`~/.local/bin/xdg-recent-actions` and its units under
+`$XDG_CONFIG_HOME/systemd/user` (normally `~/.config/systemd/user`).
 
-Keep the state directory while overrides are installed. Its per-app records
-contain the original user entries needed for restoration. Older state is
-migrated automatically during installation; preflight checks leave it untouched.
+## Processing
 
-Applications must record history in XBEL for it to appear here. This program
-does not read private application history databases. A launcher's own cache may
-require reopening its menu before updated actions appear. Changes to installed
-applications are incorporated at the next history change or manual sync.
+A systemd path unit watches `recently-used.xbel` using inotify. After a write
+closes or the file is replaced, it starts one Rust process. There is no polling
+or resident helper.
 
-## Inspect or run manually
+The XML is scanned through a buffered reader. At most eight 32-byte bookmark
+pins are retained per matched application. After validating the document, the
+program rereads those headers and processes one desktop file at a time. BLAKE3
+checksums detect unchanged output, which is not rewritten. Checksums are not
+stored on disk.
+
+Application names, desktop IDs, and launch executables are matched automatically.
+Ambiguous and unmatched records are skipped. Only existing local files and
+folders are included. Actions launch through the desktop entry using `gio launch`.
+Applications must record history in XBEL; private application history databases
+are not read. Vendor changes are picked up on the next sync. A launcher's cache
+may require reopening its menu before updated actions appear.
+
+## Commands
 
 ```sh
 ~/.local/bin/xdg-recent-actions check
 ~/.local/bin/xdg-recent-actions sync
 systemctl --user status xdg-recent-actions.path
 journalctl --user -u xdg-recent-actions.service
-```
-
-`check` previews updates without writing files. Each run reports its elapsed
-time and the number of unmatched or ambiguous records.
-
-## Uninstall
-
-```sh
 make uninstall
 ```
 
-Stops monitoring, restores original user entries, removes generated overrides,
-and removes the binary and units. If a generated file was edited manually,
-restoration stops with an error and leaves the installation available for
-recovery, with monitoring stopped. The state directory is retained.
+`check` previews changes without writing files. Uninstall stops monitoring,
+restores originals, and removes generated files, symlinks, the binary, and units.
+It refuses to overwrite a replacement entry.
 
 ## Development
 
@@ -103,16 +96,16 @@ make test
 make check
 ```
 
-`make check` requires rustfmt and Clippy. An additional GIO activation test uses
-`desktop-file-validate` and `python3-gi`; run it with
-`cargo test --locked -- --include-ignored`. The optional benchmark harness also uses Python 3 and GNU time.
-
-To compare release builds without touching installed entries:
+`make check` requires rustfmt and Clippy. The additional GIO activation test uses
+`desktop-file-validate` and `python3-gi`:
 
 ```sh
-python3 tools/benchmark.py --variant before=/path/to/old-binary --variant after=target/release/xdg-recent-actions --output results.json
+cargo test --locked -- --include-ignored
 ```
 
-It snapshots the current history into temporary directories and also measures
-synthetic histories and large desktop entries. Results include elapsed time and
-peak resident memory. All generated files are removed afterward.
+The benchmark harness requires Python 3 and GNU time. It works in temporary
+folders and measures elapsed time and peak resident memory:
+
+```sh
+python3 tools/benchmark.py --variant current=target/release/xdg-recent-actions --output /tmp/xdg-recent-actions-bench.json
+```

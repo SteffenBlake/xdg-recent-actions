@@ -37,7 +37,15 @@ printf 'Building and testing before touching the running installation...\n'
 cargo build --release --locked
 cargo test --locked
 ./target/release/$name --version
-./target/release/$name check
+legacy=0
+if [ -f "$state/$name/state.json" ]; then
+    [ -x "$bindir/$name" ] || fail 'an older state file exists but its installed binary is missing; restore that installation first'
+    XDG_DATA_HOME="$data" XDG_STATE_HOME="$state" "$bindir/$name" check
+    legacy=1
+    printf 'Transition: the installed binary will restore its entries before the symlink layout is applied.\n'
+else
+    ./target/release/$name check
+fi
 stage=$(mktemp -d "$state/$name/install.XXXXXX")
 cleanup() { rm -rf "$stage"; }
 trap cleanup EXIT
@@ -47,7 +55,6 @@ trap 'exit 143' HUP TERM
 quote() { printf '%s' "$1" | sed 's/%/%%/g; s/"/\\"/g'; }
 qbin=$(quote "$(pwd)/target/release/$name" | sed 's/\$/$$/g')
 qdata=$(quote "$data")
-qstate=$(quote "$state")
 qwatch=$(printf '%s' "$data/recently-used.xbel" | sed 's/%/%%/g')
 qdirs=$(quote "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}")
 cat > "$stage/$name.service" <<UNIT
@@ -59,7 +66,6 @@ StartLimitIntervalSec=0
 Type=oneshot
 ExecStart="$qbin" sync
 Environment="XDG_DATA_HOME=$qdata"
-Environment="XDG_STATE_HOME=$qstate"
 Environment="XDG_DATA_DIRS=$qdirs"
 UMask=0077
 NoNewPrivileges=yes
@@ -92,12 +98,10 @@ done
 rollback() {
     printf 'Activation failed; restoring the previous binary and units.\n' >&2
     systemctl --user stop "$name.path" "$name.service" >/dev/null 2>&1 || :
-    # Keep recovery state readable by an older binary after a format migration.
-    if [ -f "$stage/$name.old" ] && [ -x "$bindir/$name" ]; then
-        if ! XDG_DATA_HOME="$data" XDG_STATE_HOME="$state" "$bindir/$name" export-state-v1; then
-            printf 'Could not export recovery state; keeping the candidate binary for recovery.\n' >&2
-            cp -p "$bindir/$name" "$stage/$name.old"
-        fi
+    restored=1
+    if ! XDG_DATA_HOME="$data" ./target/release/$name restore; then
+        printf 'Some replacement entries could not be restored; backups were retained and monitoring will stay stopped.\n' >&2
+        restored=0
     fi
     for file in "$bindir/$name" "$units/$name.service" "$units/$name.path"; do
         old=$stage/$(basename "$file").old
@@ -105,13 +109,20 @@ rollback() {
     done
     systemctl --user daemon-reload || :
     if [ "$was_enabled" != enabled ]; then systemctl --user disable "$name.path" >/dev/null 2>&1 || :; fi
-    if [ "$was_active" = active ]; then systemctl --user start "$name.path" || :; fi
+    if [ "$restored" = 1 ] && [ -x "$bindir/$name" ]; then
+        XDG_DATA_HOME="$data" XDG_STATE_HOME="$state" "$bindir/$name" sync || restored=0
+    fi
+    if [ "$was_active" = active ] && [ "$restored" = 1 ]; then systemctl --user start "$name.path" || :; fi
 }
 trap 'rollback; cleanup; exit 130' INT
 trap 'rollback; cleanup; exit 143' HUP TERM
 systemctl --user stop "$name.path" "$name.service" >/dev/null 2>&1 || :
 # Stage beside destinations so rename never exposes a partial executable or unit.
 if ! (
+    if [ "$legacy" = 1 ]; then
+        XDG_DATA_HOME="$data" XDG_STATE_HOME="$state" "$bindir/$name" restore || exit 1
+        ./target/release/$name check || exit 1
+    fi
     install -m755 "target/release/$name" "$bindir/.$name.new" || exit 1
     mv -f "$bindir/.$name.new" "$bindir/$name" || exit 1
     for kind in service path; do
@@ -127,6 +138,10 @@ if ! (
 ); then rollback; fail 'installation rolled back; inspect journalctl --user -u xdg-recent-actions.service'; fi
 trap 'exit 130' INT
 trap 'exit 143' HUP TERM
-printf '\nInstalled %s\nWatcher: active (no polling).\nUnits: %s\nState/backups: %s/%s\n' "$name" "$units" "$state" "$name"
+if [ "$legacy" = 1 ]; then
+    rm -f "$state/$name/state.json" "$state/$name/lock"
+    rmdir "$state/$name/entries" 2>/dev/null || :
+fi
+printf '\nInstalled %s\nWatcher: active (no polling).\nUnits: %s\nGenerated files and originals: %s/%s\n' "$name" "$units" "$data" "$name"
 if [ ! -f "$data/recently-used.xbel" ]; then printf 'History does not exist yet; the watcher will detect its creation.\n'; fi
 printf 'Logs: journalctl --user -u %s.service\nUninstall: make uninstall\n' "$name"

@@ -19,7 +19,7 @@ if [ -f "$units/$name.service" ]; then
     if ! systemctl --user start "$name.service"; then
         rm "$units/$name.service.d/uninstall.conf"
         systemctl --user daemon-reload
-        echo 'Restore refused a manually edited file. Installation retained; watcher stopped. Check the service journal.' >&2
+        echo 'Restore refused to overwrite a replacement entry. Installation retained; watcher stopped. Check the service journal.' >&2
         exit 1
     fi
     rm "$units/$name.service.d/uninstall.conf"
@@ -29,4 +29,4 @@ systemctl --user disable "$name.path" 2>/dev/null || :
 rm -f "$units/$name.path" "$units/$name.service" "$binary"
 systemctl --user daemon-reload
 systemctl --user reset-failed "$name.service" "$name.path" 2>/dev/null || :
-printf 'Uninstalled. Original entries restored. Recovery state retained at %s\n' "$state"
+printf 'Uninstalled. Original entries restored; generated files and symlinks removed.\n'

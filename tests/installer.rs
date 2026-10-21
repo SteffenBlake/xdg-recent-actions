@@ -159,3 +159,18 @@ fn failed_first_activation_removes_partial_installation() {
     assert!(!f.path("active").exists());
     assert!(!f.path("enabled").exists());
 }
+
+#[test]
+fn transition_restores_old_installation_and_removes_legacy_index() {
+    let f = Install::new();
+    success(f.run("install"));
+    let legacy = f.path("state/xdg-recent-actions/state.json");
+    fs::write(&legacy, "legacy fixture").unwrap();
+    let output = f.run("install");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Transition:"));
+    assert!(stdout.contains("candidate restore"));
+    success(output);
+    assert!(!legacy.exists());
+    assert!(f.path("active").exists());
+}
