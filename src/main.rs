@@ -96,7 +96,13 @@ fn desktop_keys(text: &str) -> BTreeMap<String, String> {
             && !line.starts_with('#')
             && let Some((k, v)) = line.split_once('=')
         {
-            keys.insert(k.trim().into(), v.trim().into());
+            let key = k.trim();
+            if matches!(
+                key,
+                "Type" | "Hidden" | "NoDisplay" | "Exec" | "Name" | "Actions"
+            ) {
+                keys.insert(key.into(), v.trim().into());
+            }
         }
     }
     keys
