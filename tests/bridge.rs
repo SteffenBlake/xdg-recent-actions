@@ -353,3 +353,23 @@ fn duplicate_data_roots_never_treat_generated_entries_as_vendor_sources() {
         assert!(!original_file(&f).exists());
     }
 }
+
+#[test]
+fn cli_help_and_invalid_arguments_do_not_touch_user_data() {
+    let f = Fixture::new();
+    for args in [vec!["--help"], vec!["sync", "--help"], vec!["--version"]] {
+        let output = f.ok(&args);
+        assert!(!output.stdout.is_empty());
+    }
+    for args in [
+        vec!["unknown"],
+        vec!["restore", "--dry-run"],
+        vec!["sync", "--unknown"],
+    ] {
+        let output = f.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!output.stderr.is_empty());
+    }
+    assert!(!f.path("data/xdg-recent-actions").exists());
+    assert!(!f.generated().exists());
+}

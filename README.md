@@ -29,8 +29,7 @@ make install
 ```
 
 Reinstalling prints the old and new versions before replacing the binary and
-units. If an older installation uses a different layout, its installed binary
-restores the entries before the new layout is applied.
+units.
 
 ## Files and ownership
 
@@ -94,7 +93,12 @@ It refuses to overwrite a replacement entry.
 ```sh
 make test
 make check
+make docs
 ```
+
+Source uses Rust doc comments (`///` for items, `//!` for modules), shown on
+hover in rust-analyzer. `make docs` generates browsable documentation in
+`target/doc/xdg_recent_actions/index.html`.
 
 `make check` requires rustfmt and Clippy. The additional GIO activation test uses
 `desktop-file-validate` and `python3-gi`:
