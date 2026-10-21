@@ -89,7 +89,7 @@ make uninstall
 Stops monitoring, restores original user entries, removes generated overrides,
 and removes the binary and units. If a generated file was edited manually,
 restoration stops with an error and leaves the installation available for
-recovery, with monitoring stopped. Backups remain in the state directory.
+recovery, with monitoring stopped. The state directory is retained.
 
 ## Development
 
